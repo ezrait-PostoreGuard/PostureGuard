@@ -3,6 +3,7 @@ name: Build Android APK
 on:
   push:
     branches: [ main, master ]
+  workflow_dispatch: # מוסיף כפתור הפעלה ידנית
 
 jobs:
   build:
