@@ -20,6 +20,10 @@ import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        const val EXTRA_AUTO_START = "auto_start"
+    }
+
     private var isParentUnlocked = false
     private lateinit var seekBar: SeekBar
     private lateinit var tvDistance: TextView
@@ -31,9 +35,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val prefs = getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
-        if (!prefs.contains("parent_pin")) {
-            prefs.edit().putString("parent_pin", "1234").apply()
-        }
         val savedDistance = prefs.getInt("target_distance_cm", 25)
 
         val layout = LinearLayout(this).apply {
@@ -77,7 +78,8 @@ class MainActivity : AppCompatActivity() {
                 if (isParentUnlocked) {
                     lockSettings()
                 } else {
-                    promptForPin(prefs.getString("parent_pin", "1234")!!)
+                    val pin = prefs.getString("parent_pin", null)
+                    if (pin == null) promptInitialPin(prefs) else promptForPin(pin)
                 }
             }
         }
@@ -115,7 +117,48 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnStartService)
         layout.addView(btnStopService)
 
+        val credit = TextView(this).apply {
+            text = "Developed by Ezra Itzhak"
+            textSize = 13f
+            setTextColor(android.graphics.Color.GRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, 60, 0, 0)
+        }
+        layout.addView(credit)
+
         setContentView(layout)
+
+        // First launch: parent must choose a PIN (no shared default like 1234)
+        if (!prefs.contains("parent_pin")) {
+            promptInitialPin(prefs)
+        } else if (intent.getBooleanExtra(EXTRA_AUTO_START, false)) {
+            checkPermissionsAndStart()
+        }
+    }
+
+    private fun promptInitialPin(prefs: android.content.SharedPreferences) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            hint = "בחר קוד הורה (לפחות 4 ספרות)"
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("הגדרת קוד הורה")
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton("שמור", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val pin = input.text.toString()
+                if (pin.length >= 4) {
+                    prefs.edit().putString("parent_pin", pin).apply()
+                    dialog.dismiss()
+                } else {
+                    Toast.makeText(this, "הקוד חייב להכיל לפחות 4 ספרות", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun promptForPin(correctPin: String) {
@@ -170,6 +213,11 @@ class MainActivity : AppCompatActivity() {
     private fun checkPermissionsAndStart() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 101)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 102)
             return
         }
         if (!Settings.canDrawOverlays(this)) {
