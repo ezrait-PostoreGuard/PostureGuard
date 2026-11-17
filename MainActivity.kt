@@ -117,6 +117,15 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnStartService)
         layout.addView(btnStopService)
 
+        val credit = TextView(this).apply {
+            text = "Developed by Ezra Itzhak"
+            textSize = 13f
+            setTextColor(android.graphics.Color.GRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, 60, 0, 0)
+        }
+        layout.addView(credit)
+
         setContentView(layout)
 
         // First launch: parent must choose a PIN (no shared default like 1234)
