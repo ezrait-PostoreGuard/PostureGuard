@@ -5,10 +5,15 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Build
-import android.os.PowerManager
-import android.os.SystemClock
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.os.*
 import android.util.Size
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -22,9 +27,23 @@ import java.util.concurrent.Executors
 
 class PostureMonitorService : LifecycleService() {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // ניטור מרחק (חלונית צפה מעל האפליקציה)
     private var tooCloseStartTime: Long = 0L
-    private var isBreakActive = false
-    private val TRIGGER_DELAY_MS = 3000L
+    private var safeDistanceStartTime: Long = 0L
+    private var isProximityOverlayShowing = false
+    private var proximityOverlayView: View? = null
+    private lateinit var windowManager: WindowManager
+
+    private val PROXIMITY_TRIGGER_DELAY_MS = 2000L // 2 שניות קרבה להצגת האזהרה
+    private val PROXIMITY_DISMISS_DELAY_MS = 800L  // 0.8 שניות התרחקות להעלמת האזהרה
+
+    // טיימר 20 דקות (מסך הפסקה מלא ונעול)
+    private var activeUsageSeconds = 0
+    private var isLongBreakActive = false
+    private var isUsageTimerRunning = false
+    private val LONG_BREAK_INTERVAL_SECONDS = 1200 // 20 דקות
 
     private val faceDetector by lazy {
         val options = FaceDetectorOptions.Builder()
@@ -33,42 +52,49 @@ class PostureMonitorService : LifecycleService() {
         FaceDetection.getClient(options)
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        isBreakActive = false
+        isLongBreakActive = false
+        activeUsageSeconds = 0
         tooCloseStartTime = 0L
+        safeDistanceStartTime = 0L
+        hideProximityOverlay()
+
         startForegroundNotification()
         startFrontCameraAnalysis()
+        if (!isUsageTimerRunning) {
+            startUsageTimer()
+        }
         return START_STICKY
     }
 
     private fun startForegroundNotification() {
         val channelId = "PostureGuardChannel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "ניטור מרחק פעיל", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(channelId, "ניטור מרחק והפסקות פעיל", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("PostureGuard פעיל ברקע")
-            .setContentText("ניטור אוטומטי בזמן שימוש באפליקציות")
+            .setContentText("מנטר מרחק מהמסך וזמני הפסקות")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)
             .build()
         startForeground(1, notification)
     }
 
-    // המרת המרחק שנבחר (10-40 ס"מ) ליחס רוחב פנים במצלמה קדמית סטנדרטית
     private fun getFaceRatioThreshold(): Float {
         val prefs = getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
         val distanceCm = prefs.getInt("target_distance_cm", 25).coerceIn(10, 40)
-        // נוסחה אמפירית לעדשת סלפי: ב-10 ס"מ היחס ~0.85, ב-40 ס"מ היחס ~0.30
         return (12.0f / distanceCm).coerceIn(0.28f, 0.85f)
     }
 
-    // בדיקה האם המסך דלוק, לא נעול, ופתוחה אפליקציה שאינה מסך הבית או PostureGuard
-    private fun shouldMonitorNow(): Boolean {
-        if (isBreakActive) return false
-
+    private fun isExternalAppInForeground(): Boolean {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!powerManager.isInteractive) return false
 
@@ -92,6 +118,44 @@ class PostureMonitorService : LifecycleService() {
         return stats?.maxByOrNull { it.lastTimeUsed }?.packageName
     }
 
+    private fun startUsageTimer() {
+        isUsageTimerRunning = true
+        Thread {
+            while (isUsageTimerRunning) {
+                try {
+                    Thread.sleep(1000)
+                } catch (e: InterruptedException) {
+                    break
+                }
+
+                if (isLongBreakActive) continue
+
+                if (isExternalAppInForeground()) {
+                    activeUsageSeconds++
+                    if (activeUsageSeconds >= LONG_BREAK_INTERVAL_SECONDS) {
+                        activeUsageSeconds = 0
+                        triggerLongBreakScreen()
+                    }
+                } else {
+                    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                    val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                    if (!powerManager.isInteractive || keyguardManager.isKeyguardLocked) {
+                        activeUsageSeconds = 0
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun triggerLongBreakScreen() {
+        isLongBreakActive = true
+        hideProximityOverlay()
+        val intent = Intent(this, BreakActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        startActivity(intent)
+    }
+
     @OptIn(ExperimentalGetImage::class)
     private fun startFrontCameraAnalysis() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -103,10 +167,12 @@ class PostureMonitorService : LifecycleService() {
                 .build()
                 .also { analysis ->
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        if (shouldMonitorNow()) {
+                        if (!isLongBreakActive && isExternalAppInForeground()) {
                             processFrame(imageProxy)
                         } else {
                             tooCloseStartTime = 0L
+                            safeDistanceStartTime = 0L
+                            hideProximityOverlay()
                             imageProxy.close()
                         }
                     }
@@ -132,20 +198,38 @@ class PostureMonitorService : LifecycleService() {
             faceDetector.process(image)
                 .addOnSuccessListener { faces ->
                     val largestFace = faces.maxByOrNull { it.boundingBox.width() }
+                    val now = System.currentTimeMillis()
+
                     if (largestFace != null) {
                         val faceRatio = largestFace.boundingBox.width() / frameWidth
                         if (faceRatio >= threshold) {
-                            val now = System.currentTimeMillis()
-                            if (tooCloseStartTime == 0L) {
-                                tooCloseStartTime = now
-                            } else if (now - tooCloseStartTime >= TRIGGER_DELAY_MS) {
-                                triggerBreakScreen()
+                            safeDistanceStartTime = 0L
+                            if (!isProximityOverlayShowing) {
+                                if (tooCloseStartTime == 0L) {
+                                    tooCloseStartTime = now
+                                } else if (now - tooCloseStartTime >= PROXIMITY_TRIGGER_DELAY_MS) {
+                                    showProximityOverlay()
+                                }
                             }
                         } else {
                             tooCloseStartTime = 0L
+                            if (isProximityOverlayShowing) {
+                                if (safeDistanceStartTime == 0L) {
+                                    safeDistanceStartTime = now
+                                } else if (now - safeDistanceStartTime >= PROXIMITY_DISMISS_DELAY_MS) {
+                                    hideProximityOverlay()
+                                }
+                            }
                         }
                     } else {
                         tooCloseStartTime = 0L
+                        if (isProximityOverlayShowing) {
+                            if (safeDistanceStartTime == 0L) {
+                                safeDistanceStartTime = now
+                            } else if (now - safeDistanceStartTime >= PROXIMITY_DISMISS_DELAY_MS) {
+                                hideProximityOverlay()
+                            }
+                        }
                     }
                 }
                 .addOnCompleteListener { imageProxy.close() }
@@ -154,16 +238,83 @@ class PostureMonitorService : LifecycleService() {
         }
     }
 
-    private fun triggerBreakScreen() {
-        isBreakActive = true
-        tooCloseStartTime = 0L
-        val intent = Intent(this, BreakActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+    private fun showProximityOverlay() {
+        mainHandler.post {
+            if (isProximityOverlayShowing || isLongBreakActive) return@post
+
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setBackgroundColor(Color.parseColor("#D9111827"))
+                setPadding(60, 60, 60, 60)
+            }
+
+            val iconText = TextView(this).apply {
+                text = "👀"
+                textSize = 54f
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, 24)
+            }
+
+            val titleText = TextView(this).apply {
+                text = "קרוב מדי למסך!"
+                textSize = 26f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, 16)
+            }
+
+            val descText = TextView(this).apply {
+                text = "הרחק מעט את הטלפון מהפנים.\nהמסך יחזור לפעול אוטומטית ברגע שתתרחק."
+                textSize = 18f
+                setTextColor(Color.parseColor("#E5E7EB"))
+                gravity = Gravity.CENTER
+            }
+
+            container.addView(iconText)
+            container.addView(titleText)
+            container.addView(descText)
+
+            val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+            }
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                layoutFlag,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            )
+
+            try {
+                windowManager.addView(container, params)
+                proximityOverlayView = container
+                isProximityOverlayShowing = true
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
-        startActivity(intent)
     }
 
-    // הפעלה מחדש אוטומטית אם הילד מחליק את האפליקציה מרשימת היישומים האחרונים
+    private fun hideProximityOverlay() {
+        mainHandler.post {
+            if (!isProximityOverlayShowing || proximityOverlayView == null) return@post
+            try {
+                windowManager.removeView(proximityOverlayView)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                proximityOverlayView = null
+                isProximityOverlayShowing = false
+                safeDistanceStartTime = 0L
+            }
+        }
+    }
+
     override fun onTaskRemoved(rootIntent: Intent?) {
         val restartIntent = Intent(applicationContext, PostureMonitorService::class.java)
         val pendingIntent = PendingIntent.getService(
@@ -175,6 +326,8 @@ class PostureMonitorService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        isUsageTimerRunning = false
+        hideProximityOverlay()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
