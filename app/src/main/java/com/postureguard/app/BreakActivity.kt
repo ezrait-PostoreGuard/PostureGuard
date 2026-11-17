@@ -1,5 +1,7 @@
 package com.postureguard.app
 
+import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -11,20 +13,21 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 
 class BreakActivity : AppCompatActivity() {
+
+    private var isTimerFinished = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_break)
 
-        // חסימת כפתור חזור כדי שהילד לא יוכל לדלג על ההפסקה
+        // חסימת כפתור חזור בזמן הפסקת ה-20 דקות
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                // לא מבצעים כלום בזמן ההפסקה
-            }
+            override fun handleOnBackPressed() {}
         })
 
         val tvTimer = findViewById<TextView>(R.id.tvCountdown)
         val tvStatus = findViewById<TextView>(R.id.tvStatusMessage)
-        tvStatus.text = "אנא צפה בחפץ מרוחק עד שמסך זה ייעלם ויישמע צפצוף"
+        tvStatus.text = "עברו 20 דקות שימוש רצוף.\nאנא צפה בחפץ מרוחק עד שמסך זה ייעלם ויישמע צפצוף"
 
         object : CountDownTimer(25000, 1000) {
             override fun onTick(millisUntilFinished: Long) {
@@ -32,6 +35,7 @@ class BreakActivity : AppCompatActivity() {
             }
 
             override fun onFinish() {
+                isTimerFinished = true
                 try {
                     ToneGenerator(AudioManager.STREAM_ALARM, 100)
                         .startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
@@ -50,5 +54,18 @@ class BreakActivity : AppCompatActivity() {
                 finish()
             }
         }.start()
+    }
+
+    // מניעת מזעור מסך ההפסקה לרקע בלחיצה על כפתור הבית או יישומים אחרונים
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!isTimerFinished) {
+            val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            activityManager.moveTaskToFront(taskId, 0)
+            val bringBackIntent = Intent(this, BreakActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            startActivity(bringBackIntent)
+        }
     }
 }
