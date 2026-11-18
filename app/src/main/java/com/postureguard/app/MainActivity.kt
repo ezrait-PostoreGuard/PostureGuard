@@ -132,6 +132,18 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnProtect)
 
+        val btnUnprotect = Button(this).apply {
+            text = "🔓 בטל הגנה מפני הסרה"
+            setOnClickListener {
+                if (!isParentUnlocked) {
+                    Toast.makeText(this@MainActivity, "יש לפתוח נעילת הורה קודם", Toast.LENGTH_SHORT).show()
+                } else {
+                    disableDeviceAdmin()
+                }
+            }
+        }
+        layout.addView(btnUnprotect)
+
         prefs.getString("tamper_log", null)?.let { time ->
             layout.addView(TextView(this).apply {
                 text = "⚠️ הגנת ההסרה בוטלה ב-$time"
@@ -287,6 +299,20 @@ class MainActivity : AppCompatActivity() {
                 "מונע מהילד להסיר או לעצור את PostureGuard")
         }
         startActivity(intent)
+    }
+
+    private fun disableDeviceAdmin() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        val admin = ComponentName(this, AdminReceiver::class.java)
+        if (!dpm.isAdminActive(admin)) {
+            Toast.makeText(this, "ההגנה כבר כבויה", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Tell AdminReceiver this was the parent, so no tamper alert
+        getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
+            .edit().putBoolean("parent_disabling", true).apply()
+        dpm.removeActiveAdmin(admin)
+        Toast.makeText(this, "ההגנה בוטלה - ניתן להסיר את האפליקציה", Toast.LENGTH_LONG).show()
     }
 
     private fun hasUsageStatsPermission(): Boolean {
