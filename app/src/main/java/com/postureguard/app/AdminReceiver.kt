@@ -19,6 +19,12 @@ class AdminReceiver : DeviceAdminReceiver() {
     }
 
     override fun onDisabled(context: Context, intent: Intent) {
+        val prefs = context.getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("parent_disabling", false)) {
+            // Parent turned it off with the PIN - no alert
+            prefs.edit().putBoolean("parent_disabling", false).apply()
+            return
+        }
         // Record the time so the parent sees it on the main screen
         val time = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(Date())
         context.getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
