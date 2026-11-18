@@ -2,6 +2,8 @@ package com.postureguard.app
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
@@ -104,6 +106,7 @@ class MainActivity : AppCompatActivity() {
             text = "עצור שירות (דורש קוד הורה)"
             isEnabled = false
             setOnClickListener {
+                prefs.edit().putBoolean("parent_stopped", true).apply()
                 stopService(Intent(this@MainActivity, PostureMonitorService::class.java))
                 Toast.makeText(this@MainActivity, "השירות הופסק", Toast.LENGTH_SHORT).show()
             }
@@ -116,6 +119,34 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnChangePin)
         layout.addView(btnStartService)
         layout.addView(btnStopService)
+
+        val btnProtect = Button(this).apply {
+            text = "🛡️ הפעל הגנה מפני הסרה"
+            setOnClickListener {
+                if (!isParentUnlocked) {
+                    Toast.makeText(this@MainActivity, "יש לפתוח נעילת הורה קודם", Toast.LENGTH_SHORT).show()
+                } else {
+                    requestDeviceAdmin()
+                }
+            }
+        }
+        layout.addView(btnProtect)
+
+        prefs.getString("tamper_log", null)?.let { time ->
+            layout.addView(TextView(this).apply {
+                text = "⚠️ הגנת ההסרה בוטלה ב-$time"
+                setTextColor(android.graphics.Color.RED)
+                gravity = Gravity.CENTER
+                setPadding(0, 30, 0, 0)
+                setOnLongClickListener {
+                    if (isParentUnlocked) {
+                        prefs.edit().remove("tamper_log").apply()
+                        visibility = android.view.View.GONE
+                    }
+                    true
+                }
+            })
+        }
 
         val credit = TextView(this).apply {
             text = "Developed by Ezra Itzhak"
@@ -231,6 +262,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE)
+            .edit().putBoolean("parent_stopped", false).apply()
         val serviceIntent = Intent(this, PostureMonitorService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
@@ -239,6 +272,21 @@ class MainActivity : AppCompatActivity() {
         }
         lockSettings()
         Toast.makeText(this, "השירות הופעל וההגדרות ננעלו", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun requestDeviceAdmin() {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        val admin = ComponentName(this, AdminReceiver::class.java)
+        if (dpm.isAdminActive(admin)) {
+            Toast.makeText(this, "ההגנה כבר פעילה", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+            putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
+            putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                "מונע מהילד להסיר או לעצור את PostureGuard")
+        }
+        startActivity(intent)
     }
 
     private fun hasUsageStatsPermission(): Boolean {
