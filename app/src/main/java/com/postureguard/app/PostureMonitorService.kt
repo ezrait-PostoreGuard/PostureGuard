@@ -1,6 +1,8 @@
 package com.postureguard.app
 
 import android.app.*
+import android.app.usage.UsageEvents
+import android.content.pm.ServiceInfo
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -30,9 +32,9 @@ class PostureMonitorService : LifecycleService() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ניטור מרחק (חלונית צפה מעל האפליקציה)
-    private var tooCloseStartTime: Long = 0L
-    private var safeDistanceStartTime: Long = 0L
-    private var isProximityOverlayShowing = false
+    @Volatile private var tooCloseStartTime: Long = 0L
+    @Volatile private var safeDistanceStartTime: Long = 0L
+    @Volatile private var isProximityOverlayShowing = false
     private var proximityOverlayView: View? = null
     private lateinit var windowManager: WindowManager
 
@@ -40,10 +42,18 @@ class PostureMonitorService : LifecycleService() {
     private val PROXIMITY_DISMISS_DELAY_MS = 800L  // 0.8 שניות התרחקות להעלמת האזהרה
 
     // טיימר 20 דקות (מסך הפסקה מלא ונעול)
-    private var activeUsageSeconds = 0
-    private var isLongBreakActive = false
-    private var isUsageTimerRunning = false
+    @Volatile private var activeUsageSeconds = 0
+    @Volatile private var isLongBreakActive = false
+    @Volatile private var isUsageTimerRunning = false
     private val LONG_BREAK_INTERVAL_SECONDS = 1200 // 20 דקות
+
+    // Cached once per second by the timer thread (instead of per camera frame)
+    private var blockedFromBackground = false
+    @Volatile private var isExternalAppActive = false
+    @Volatile private var lastForegroundPkg: String? = null
+    @Volatile private var cachedThreshold = 0.48f
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var isCameraBound = false
 
     private val faceDetector by lazy {
         val options = FaceDetectorOptions.Builder()
@@ -65,7 +75,17 @@ class PostureMonitorService : LifecycleService() {
         safeDistanceStartTime = 0L
         hideProximityOverlay()
 
-        startForegroundNotification()
+        try {
+            startForegroundNotification()
+        } catch (e: Exception) {
+            // Android 14+: camera service can't start from background (e.g. at boot)
+            e.printStackTrace()
+            blockedFromBackground = true
+            BootReceiver.showResumeNotification(this)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        cachedThreshold = getFaceRatioThreshold()
         startFrontCameraAnalysis()
         if (!isUsageTimerRunning) {
             startUsageTimer()
@@ -85,7 +105,11 @@ class PostureMonitorService : LifecycleService() {
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)
             .build()
-        startForeground(1, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+        } else {
+            startForeground(1, notification)
+        }
     }
 
     private fun getFaceRatioThreshold(): Float {
@@ -113,9 +137,16 @@ class PostureMonitorService : LifecycleService() {
 
     private fun getForegroundPackageName(): String? {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        val time = System.currentTimeMillis()
-        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, time - 1000 * 60, time)
-        return stats?.maxByOrNull { it.lastTimeUsed }?.packageName
+        val now = System.currentTimeMillis()
+        val events = usm.queryEvents(now - 60_000, now)
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                lastForegroundPkg = event.packageName
+            }
+        }
+        return lastForegroundPkg
     }
 
     private fun startUsageTimer() {
@@ -128,9 +159,15 @@ class PostureMonitorService : LifecycleService() {
                     break
                 }
 
-                if (isLongBreakActive) continue
+                if (isLongBreakActive) {
+                    isExternalAppActive = false
+                    continue
+                }
 
-                if (isExternalAppInForeground()) {
+                isExternalAppActive = isExternalAppInForeground()
+                cachedThreshold = getFaceRatioThreshold()
+
+                if (isExternalAppActive) {
                     activeUsageSeconds++
                     if (activeUsageSeconds >= LONG_BREAK_INTERVAL_SECONDS) {
                         activeUsageSeconds = 0
@@ -156,18 +193,35 @@ class PostureMonitorService : LifecycleService() {
         startActivity(intent)
     }
 
+    // Pause the camera when not needed (screen off / own app / launcher) to save battery
+    private fun updateCameraState() {
+        mainHandler.post {
+            val provider = cameraProvider ?: return@post
+            if (!isExternalAppActive && isCameraBound) {
+                provider.unbindAll()
+                isCameraBound = false
+                tooCloseStartTime = 0L
+                safeDistanceStartTime = 0L
+                hideProximityOverlay()
+            } else if (isExternalAppActive && !isCameraBound) {
+                startFrontCameraAnalysis()
+            }
+        }
+    }
+
     @OptIn(ExperimentalGetImage::class)
     private fun startFrontCameraAnalysis() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
+            this.cameraProvider = cameraProvider
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetResolution(Size(480, 640))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
                 .also { analysis ->
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        if (!isLongBreakActive && isExternalAppInForeground()) {
+                        if (!isLongBreakActive && isExternalAppActive) {
                             processFrame(imageProxy)
                         } else {
                             tooCloseStartTime = 0L
@@ -181,6 +235,7 @@ class PostureMonitorService : LifecycleService() {
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, imageAnalyzer)
+                isCameraBound = true
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -193,7 +248,7 @@ class PostureMonitorService : LifecycleService() {
         if (mediaImage != null) {
             val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
             val frameWidth = if (imageProxy.imageInfo.rotationDegrees % 180 == 0) imageProxy.width.toFloat() else imageProxy.height.toFloat()
-            val threshold = getFaceRatioThreshold()
+            val threshold = cachedThreshold
 
             faceDetector.process(image)
                 .addOnSuccessListener { faces ->
@@ -315,19 +370,35 @@ class PostureMonitorService : LifecycleService() {
         }
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
+    private fun parentStopped(): Boolean =
+        getSharedPreferences("PostureGuardPrefs", Context.MODE_PRIVATE).getBoolean("parent_stopped", false)
+
+    // Auto-restart: if the service is killed (not by the parent), bring it back in 1 second
+    private fun scheduleRestart() {
+        if (parentStopped() || blockedFromBackground) return
         val restartIntent = Intent(applicationContext, PostureMonitorService::class.java)
-        val pendingIntent = PendingIntent.getService(
+        val pendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this, 1, restartIntent, PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else PendingIntent.getService(
             this, 1, restartIntent, PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
         )
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000, pendingIntent)
+        alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 1000, pendingIntent)
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        scheduleRestart()
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
+        scheduleRestart()
         isUsageTimerRunning = false
         hideProximityOverlay()
+        cameraProvider?.unbindAll()
+        faceDetector.close()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
