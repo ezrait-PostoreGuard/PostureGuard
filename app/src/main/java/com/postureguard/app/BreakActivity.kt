@@ -37,8 +37,9 @@ class BreakActivity : AppCompatActivity() {
             override fun onFinish() {
                 isTimerFinished = true
                 try {
-                    ToneGenerator(AudioManager.STREAM_ALARM, 100)
-                        .startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+                    val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                    tone.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+                    android.os.Handler(mainLooper).postDelayed({ tone.release() }, 1000)
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
